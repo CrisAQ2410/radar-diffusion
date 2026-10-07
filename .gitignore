@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Checkpoints / model weights
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Outputs
+outputs/
+
+# Dataset
+data/
+Radar/
+*.tif
+*.tiff
+
+# Cache / logs
+.cache/
+wandb/
+runs/
+logs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
