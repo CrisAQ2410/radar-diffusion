@@ -1,25 +1,28 @@
 data:
   root: "/home/student/chipk/Radar"
-  image_size: 256
+  image_size: 80
   max_rainfall: 260.0
   input_frames: 6
   output_frames: 6
-  val_ratio: 0.1
-  test_year: 2023
-
-vae:
-  config: "configs/radar_vae.yaml"
-  checkpoint: "checkpoints/vae_kl/vae.pt"
 
 model:
-  input_shape: [6, 32, 32, 64]
-  target_shape: [6, 32, 32, 64]
+  input_shape: [6, 80, 80, 1]
+  target_shape: [6, 80, 80, 1]
 
-  base_units: 128
-  scale_alpha: 1.0
+  # Thesis: projector 1 -> 256
+  base_units: 256
+
+  # Với downsample=2 và 2 level:
+  # 256 -> 1024
+  scale_alpha: 2.0
+
   num_heads: 4
 
+  # Giữ depth hiện tại trước:
+  # 4 attention block ở level 80x80,
+  # 4 ở level 40x40 mỗi nhánh.
   depth: [4, 4]
+
   self_pattern: "axial"
 
   downsample: 2
@@ -39,7 +42,7 @@ model:
   padding_type: "zeros"
   pos_embed_type: "t+h+w"
 
-  checkpoint_level: 0
+  checkpoint_level: 2
   use_relative_pos: true
   self_attn_use_final_proj: true
 
@@ -65,6 +68,9 @@ diffusion:
   learn_logvar: true
   logvar_init: 0.0
 
+loss:
+  type: "mse"
+
 training:
   device: "cuda:2"
 
@@ -78,12 +84,15 @@ training:
   accumulation_steps: 6
   ema_decay: 0.9999
 
-  resume: "checkpoints/ldm_mode/best.pt"
+  # checkpoint latent cũ không load được nữa
+  resume: null
 
   epochs: 70
 
-  max_train_batches: null
-  max_val_batches: null
+  max_train_batches: 5
+  max_val_batches: 2
+
+  use_ema: false
 
 output:
-  dir: "checkpoints/ldm_mode"
+  dir: "checkpoints/image_diffusion_mse"

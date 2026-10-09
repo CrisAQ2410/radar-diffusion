@@ -1,4 +1,11 @@
 import os
+
+# Phải set trước khi CUDA được khởi tạo
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True",
+)
+
 from pathlib import Path
 
 import torch
@@ -8,161 +15,79 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from datasets.radar_dataset import RadarDataset
-
-from models.VAE.autoencoder_kl import AutoencoderKL
-
-from models.LDM.cuboid_transformer_unet import (
-    CuboidTransformerUNet
-)
-
-from models.ldm import RadarLatentDiffusion
-
+from losses.factory import build_loss
+from models.diffusion import GaussianDiffusion
+from models.LDM.cuboid_transformer_unet import CuboidTransformerUNet
+from models.ldm import RadarDiffusionModel
 from utils.ema import LitEma
 
 
-def build_vae(cfg):
+# ============================================================
+# Helpers
+# ============================================================
 
-    with open(
-        cfg["vae"]["config"],
-        "r"
-    ) as f:
-        vae_cfg = yaml.safe_load(f)
+def clear_cuda():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    m = vae_cfg["model"]
 
-    vae = AutoencoderKL(
-        in_channels=m["in_channels"],
-        out_channels=m["out_channels"],
+def print_cuda_memory(prefix=""):
+    if not torch.cuda.is_available():
+        return
 
-        down_block_types=tuple(
-            m["down_block_types"]
-        ),
+    allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+    max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)
 
-        up_block_types=tuple(
-            m["up_block_types"]
-        ),
-
-        block_out_channels=tuple(
-            m["block_out_channels"]
-        ),
-
-        layers_per_block=m[
-            "layers_per_block"
-        ],
-
-        latent_channels=m[
-            "latent_channels"
-        ],
-
-        norm_num_groups=m[
-            "norm_num_groups"
-        ],
+    print(
+        f"{prefix} CUDA | "
+        f"allocated={allocated:.2f} GB | "
+        f"reserved={reserved:.2f} GB | "
+        f"peak={max_allocated:.2f} GB"
     )
 
-    state = torch.load(
-        cfg["vae"]["checkpoint"],
-        map_location="cpu"
-    )
 
-    vae.load_state_dict(state)
-
-    return vae
-
+# ============================================================
+# Build denoiser
+# ============================================================
 
 def build_denoiser(cfg):
-
     m = cfg["model"]
 
-    num_blocks = len(
-        m["depth"]
-    )
-
-    patterns = [
-        m["self_pattern"]
-    ] * num_blocks
+    num_blocks = len(m["depth"])
+    patterns = [m["self_pattern"]] * num_blocks
 
     return CuboidTransformerUNet(
+        input_shape=m["input_shape"],
+        target_shape=m["target_shape"],
 
-        input_shape=m[
-            "input_shape"
-        ],
-
-        target_shape=m[
-            "target_shape"
-        ],
-
-        base_units=m[
-            "base_units"
-        ],
-
-        scale_alpha=m[
-            "scale_alpha"
-        ],
-
+        base_units=m["base_units"],
+        scale_alpha=m["scale_alpha"],
         depth=m["depth"],
 
-        downsample=m[
-            "downsample"
-        ],
+        downsample=m["downsample"],
+        downsample_type=m["downsample_type"],
 
-        downsample_type=m[
-            "downsample_type"
-        ],
-
-        upsample_type=m[
-            "upsample_type"
-        ],
-
-        upsample_kernel_size=m[
-            "upsample_kernel_size"
-        ],
+        upsample_type=m["upsample_type"],
+        upsample_kernel_size=m["upsample_kernel_size"],
 
         block_attn_patterns=patterns,
 
-        num_heads=m[
-            "num_heads"
-        ],
+        num_heads=m["num_heads"],
 
-        attn_drop=m[
-            "attn_drop"
-        ],
+        attn_drop=m["attn_drop"],
+        proj_drop=m["proj_drop"],
+        ffn_drop=m["ffn_drop"],
 
-        proj_drop=m[
-            "proj_drop"
-        ],
+        ffn_activation=m["ffn_activation"],
+        gated_ffn=m["gated_ffn"],
 
-        ffn_drop=m[
-            "ffn_drop"
-        ],
+        norm_layer=m["norm_layer"],
+        padding_type=m["padding_type"],
+        pos_embed_type=m["pos_embed_type"],
 
-        ffn_activation=m[
-            "ffn_activation"
-        ],
-
-        gated_ffn=m[
-            "gated_ffn"
-        ],
-
-        norm_layer=m[
-            "norm_layer"
-        ],
-
-        padding_type=m[
-            "padding_type"
-        ],
-
-        pos_embed_type=m[
-            "pos_embed_type"
-        ],
-
-        checkpoint_level=m[
-            "checkpoint_level"
-        ],
-
-        use_relative_pos=m[
-            "use_relative_pos"
-        ],
-
+        checkpoint_level=m["checkpoint_level"],
+        use_relative_pos=m["use_relative_pos"],
         self_attn_use_final_proj=m[
             "self_attn_use_final_proj"
         ],
@@ -170,19 +95,15 @@ def build_denoiser(cfg):
         num_global_vectors=m[
             "num_global_vectors"
         ],
-
         use_global_vector_ffn=m[
             "use_global_vector_ffn"
         ],
-
         use_global_self_attn=m[
             "use_global_self_attn"
         ],
-
         separate_global_qkv=m[
             "separate_global_qkv"
         ],
-
         global_dim_ratio=m[
             "global_dim_ratio"
         ],
@@ -203,11 +124,9 @@ def build_denoiser(cfg):
         time_embed_channels_mult=m[
             "time_embed_channels_mult"
         ],
-
         time_embed_use_scale_shift_norm=m[
             "time_embed_use_scale_shift_norm"
         ],
-
         time_embed_dropout=m[
             "time_embed_dropout"
         ],
@@ -218,124 +137,118 @@ def build_denoiser(cfg):
     )
 
 
-def make_dataset(
-    cfg,
-    split
-):
+# ============================================================
+# Dataset
+# ============================================================
 
+def make_dataset(cfg, split):
     d = cfg["data"]
 
     return RadarDataset(
         root_dir=d["root"],
-
         split=split,
 
-        input_frames=d[
-            "input_frames"
-        ],
+        input_frames=d["input_frames"],
+        output_frames=d["output_frames"],
 
-        output_frames=d[
-            "output_frames"
-        ],
-
-        image_size=d[
-            "image_size"
-        ],
-
-        max_rainfall=d[
-            "max_rainfall"
-        ],
-
-        val_ratio=d[
-            "val_ratio"
-        ],
-
-        test_year=d[
-            "test_year"
-        ],
+        image_size=d["image_size"],
+        max_rainfall=d["max_rainfall"],
     )
 
+
+# ============================================================
+# Validation
+# ============================================================
 
 @torch.no_grad()
 def validate(
     model,
     loader,
+    loss_fn,
     ema,
     device,
-    max_batches=None
+    max_batches=None,
 ):
-
     model.eval()
 
-    ema.store(
-        model.denoiser.parameters()
-    )
+    # Nếu dùng EMA thì validation bằng EMA weights
+    if ema is not None:
+        ema.store(
+            model.denoiser.parameters()
+        )
+        ema.copy_to(
+            model.denoiser
+        )
 
-    ema.copy_to(
-        model.denoiser
-    )
+    clear_cuda()
 
     total = 0.0
     count = 0
 
-    for batch_idx, (
-        past,
-        future
-    ) in enumerate(loader):
-
+    for batch_idx, (past, future) in enumerate(loader):
         if (
             max_batches is not None
-            and
-            batch_idx >= max_batches
+            and batch_idx >= max_batches
         ):
             break
 
         past = past.to(
             device,
-            non_blocking=True
+            non_blocking=True,
         )
 
         future = future.to(
             device,
-            non_blocking=True
+            non_blocking=True,
         )
 
-        result = model(
-            past,
-            future
-        )
+        # Validation cũng dùng AMP để giảm VRAM
+        with torch.cuda.amp.autocast(
+            enabled=(device.type == "cuda")
+        ):
+            result = model(
+                past,
+                future,
+            )
 
-        total += result[
-            "loss"
-        ].item()
+            val_loss = loss_fn(
+                result["pred"],
+                result["target"],
+                past,
+            )
 
+        total += val_loss.item()
         count += 1
 
+        # Xóa reference càng sớm càng tốt
+        del result
+        del val_loss
+        del past
+        del future
 
-    ema.restore(
-        model.denoiser.parameters()
-    )
+    if ema is not None:
+        ema.restore(
+            model.denoiser.parameters()
+        )
 
+    clear_cuda()
     model.train()
 
-    return total / max(
-        count,
-        1
-    )
+    return total / max(count, 1)
 
+
+# ============================================================
+# Main
+# ============================================================
 
 def main():
-
     with open(
         "configs/radar_ldm.yaml",
-        "r"
+        "r",
     ) as f:
-
         cfg = yaml.safe_load(f)
 
-    train_cfg = cfg[
-        "training"
-    ]
+    train_cfg = cfg["training"]
 
     device = torch.device(
         train_cfg["device"]
@@ -343,165 +256,194 @@ def main():
         else "cpu"
     )
 
-    print(
-        "Device:",
-        device
-    )
+    print("Device:", device)
 
-    # -----------------------------
+    # ========================================================
     # Dataset
-    # -----------------------------
+    # ========================================================
 
     train_dataset = make_dataset(
         cfg,
-        "train"
+        "train",
     )
 
     val_dataset = make_dataset(
         cfg,
-        "val"
+        "val",
     )
 
     train_loader = DataLoader(
         train_dataset,
 
-        batch_size=train_cfg[
-            "batch_size"
-        ],
-
+        batch_size=train_cfg["batch_size"],
         shuffle=True,
 
-        num_workers=train_cfg[
-            "num_workers"
-        ],
+        num_workers=train_cfg["num_workers"],
 
         pin_memory=True,
-
-        drop_last=True
+        drop_last=True,
     )
 
     val_loader = DataLoader(
         val_dataset,
 
-        batch_size=train_cfg[
-            "batch_size"
-        ],
-
+        batch_size=train_cfg["batch_size"],
         shuffle=False,
 
-        num_workers=train_cfg[
-            "num_workers"
-        ],
+        num_workers=train_cfg["num_workers"],
 
-        pin_memory=True
+        pin_memory=True,
+        drop_last=False,
     )
 
-    # -----------------------------
-    # Models
-    # -----------------------------
-
-    vae = build_vae(
-        cfg
-    ).to(device)
+    # ========================================================
+    # Model
+    # ========================================================
 
     denoiser = build_denoiser(
         cfg
     ).to(device)
 
-    dcfg = cfg[
-        "diffusion"
-    ]
+    dcfg = cfg["diffusion"]
 
-    model = RadarLatentDiffusion(
-
-        vae=vae,
-
-        denoiser=denoiser,
-
-        timesteps=dcfg[
-            "timesteps"
-        ],
-
-        cosine_s=dcfg[
-            "cosine_s"
-        ],
-
-        learn_logvar=dcfg[
-            "learn_logvar"
-        ],
-
-        logvar_init=dcfg[
-            "logvar_init"
-        ],
-
+    # Nếu GaussianDiffusion của bạn chỉ nhận timesteps
+    # thì đoạn này đúng với test_image_diffusion.py đã chạy trước đó.
+    diffusion = GaussianDiffusion(
+        timesteps=dcfg["timesteps"],
     ).to(device)
 
-    # -----------------------------
-    # optimizer
-    # -----------------------------
+    model = RadarDiffusionModel(
+        denoiser=denoiser,
+        diffusion=diffusion,
+    ).to(device)
+
+    # ========================================================
+    # Loss
+    # ========================================================
+
+    loss_fn = build_loss(
+        cfg["loss"]
+    )
+
+    print(
+        "Loss:",
+        cfg["loss"]["type"],
+    )
+
+    # ========================================================
+    # Optimizer
+    # ========================================================
 
     params = list(
         model.denoiser.parameters()
     )
 
-    if model.learn_logvar:
-        params.append(
-            model.logvar
-        )
-
+    # foreach=False giảm peak VRAM của AdamW trên model lớn.
     optimizer = torch.optim.AdamW(
-
         params,
 
-        lr=train_cfg[
-            "lr"
-        ],
+        lr=train_cfg["lr"],
+        weight_decay=train_cfg["weight_decay"],
 
-        weight_decay=train_cfg[
-            "weight_decay"
-        ],
+        foreach=False,
     )
 
-    ema = LitEma(
-        model.denoiser,
-        decay=train_cfg[
-            "ema_decay"
-        ]
+    # ========================================================
+    # AMP
+    # ========================================================
+
+    use_amp = (
+        train_cfg.get("use_amp", True)
+        and device.type == "cuda"
     )
+
+    scaler = torch.cuda.amp.GradScaler(
+        enabled=use_amp
+    )
+
+    print("AMP:", use_amp)
+
+    # ========================================================
+    # EMA - mặc định OFF để tiết kiệm VRAM
+    # ========================================================
+
+    use_ema = train_cfg.get(
+        "use_ema",
+        False,
+    )
+
+    ema = None
+
+    if use_ema:
+        ema = LitEma(
+            model.denoiser,
+            decay=train_cfg["ema_decay"],
+        )
+
+    print("EMA:", use_ema)
+
+    # ========================================================
+    # Resume
+    # ========================================================
 
     start_epoch = 1
+    best_val = float("inf")
 
-    resume_path = train_cfg.get("resume")
+    resume_path = train_cfg.get(
+        "resume"
+    )
 
     if resume_path:
-
         checkpoint = torch.load(
             resume_path,
-            map_location=device
+            map_location=device,
         )
 
         model.denoiser.load_state_dict(
             checkpoint["denoiser"]
         )
 
-        model.logvar.data.copy_(
-            checkpoint["logvar"].to(device)
-        )
-
         optimizer.load_state_dict(
             checkpoint["optimizer"]
         )
 
-        ema.load_state_dict(
-            checkpoint["ema"]
+        if (
+            ema is not None
+            and checkpoint.get("ema") is not None
+        ):
+            ema.load_state_dict(
+                checkpoint["ema"]
+            )
+
+        if (
+            use_amp
+            and checkpoint.get("scaler") is not None
+        ):
+            scaler.load_state_dict(
+                checkpoint["scaler"]
+            )
+
+        start_epoch = (
+            checkpoint["epoch"]
+            + 1
         )
 
-        start_epoch = checkpoint["epoch"] + 1
+        best_val = checkpoint.get(
+            "best_val",
+            checkpoint.get(
+                "val_loss",
+                float("inf"),
+            ),
+        )
 
         print(
             f"Resume from epoch "
             f"{checkpoint['epoch']}"
         )
+
+    # ========================================================
+    # Output
+    # ========================================================
 
     output_dir = Path(
         cfg["output"]["dir"]
@@ -509,11 +451,7 @@ def main():
 
     output_dir.mkdir(
         parents=True,
-        exist_ok=True
-    )
-
-    best_val = float(
-        "inf"
+        exist_ok=True,
     )
 
     accumulation = train_cfg[
@@ -528,19 +466,23 @@ def main():
         "max_val_batches"
     )
 
-    # -----------------------------
+    clear_cuda()
+    print_cuda_memory(
+        "Before training"
+    )
+
+    # ========================================================
     # Train
-    # -----------------------------
+    # ========================================================
 
     for epoch in range(
         start_epoch,
-        train_cfg["epochs"] + 1
+        train_cfg["epochs"] + 1,
     ):
-
         model.train()
 
-        # VAE luôn frozen + eval
-        model.vae.eval()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
 
         optimizer.zero_grad(
             set_to_none=True
@@ -548,129 +490,218 @@ def main():
 
         total_loss = 0.0
         count = 0
+        num_batches_since_step = 0
 
         pbar = tqdm(
             train_loader,
-            desc=f"Epoch {epoch}"
+            desc=f"Epoch {epoch}",
         )
 
-        for batch_idx, (
-            past,
-            future
-        ) in enumerate(pbar):
-
+        for batch_idx, (past, future) in enumerate(pbar):
             if (
-                max_train_batches
-                is not None
-                and
-                batch_idx
-                >= max_train_batches
+                max_train_batches is not None
+                and batch_idx >= max_train_batches
             ):
                 break
 
             past = past.to(
                 device,
-                non_blocking=True
+                non_blocking=True,
             )
 
             future = future.to(
                 device,
-                non_blocking=True
+                non_blocking=True,
             )
 
-            result = model(
-                past,
-                future
+            # ------------------------------------------------
+            # Forward + loss in mixed precision
+            # ------------------------------------------------
+
+            with torch.cuda.amp.autocast(
+                enabled=use_amp
+            ):
+                result = model(
+                    past,
+                    future,
+                )
+
+                raw_loss = loss_fn(
+                    result["pred"],
+                    result["target"],
+                    past,
+                )
+
+                loss = (
+                    raw_loss
+                    / accumulation
+                )
+
+            # ------------------------------------------------
+            # Backward
+            # ------------------------------------------------
+
+            scaler.scale(
+                loss
+            ).backward()
+
+            total_loss += (
+                raw_loss.detach().item()
             )
 
-            loss = (
-                result["loss"]
-                /
-                accumulation
-            )
+            count += 1
+            num_batches_since_step += 1
 
-            loss.backward()
+            # ------------------------------------------------
+            # Gradient accumulation
+            # ------------------------------------------------
 
             if (
-                (batch_idx + 1)
-                %
-                accumulation
-                == 0
+                num_batches_since_step
+                == accumulation
             ):
+                scaler.unscale_(
+                    optimizer
+                )
 
                 torch.nn.utils.clip_grad_norm_(
                     params,
                     train_cfg[
                         "gradient_clip"
-                    ]
+                    ],
                 )
 
-                optimizer.step()
+                scaler.step(
+                    optimizer
+                )
+
+                scaler.update()
 
                 optimizer.zero_grad(
                     set_to_none=True
                 )
 
-                ema(
-                    model.denoiser
-                )
+                if ema is not None:
+                    ema(
+                        model.denoiser
+                    )
 
-            total_loss += (
-                result["loss"].item()
-            )
-
-            count += 1
+                num_batches_since_step = 0
 
             pbar.set_postfix(
-                loss=(
-                    f"{result['loss'].item():.5f}"
-                ),
-                simple=(
-                    f"{result['loss_simple'].item():.5f}"
-                )
+                loss=f"{raw_loss.item():.6f}",
             )
 
-        if count % accumulation != 0:
+            # Xóa graph/reference của batch hiện tại
+            del result
+            del raw_loss
+            del loss
+            del past
+            del future
+
+        # ----------------------------------------------------
+        # Gradient accumulation còn dư
+        # ----------------------------------------------------
+
+        if num_batches_since_step > 0:
+            scaler.unscale_(
+                optimizer
+            )
+
             torch.nn.utils.clip_grad_norm_(
                 params,
-                train_cfg["gradient_clip"]
+                train_cfg[
+                    "gradient_clip"
+                ],
             )
 
-            optimizer.step()
+            scaler.step(
+                optimizer
+            )
+
+            scaler.update()
 
             optimizer.zero_grad(
                 set_to_none=True
             )
 
-            ema(
-                model.denoiser
-            )
+            if ema is not None:
+                ema(
+                    model.denoiser
+                )
 
         train_loss = (
             total_loss
-            /
-            max(count, 1)
+            / max(count, 1)
         )
+
+        clear_cuda()
+        print_cuda_memory(
+            f"Epoch {epoch} after train"
+        )
+
+        # ====================================================
+        # Emergency checkpoint sau training phase
+        # ====================================================
+
+        emergency_checkpoint = {
+            "epoch": epoch,
+
+            "denoiser":
+                model.denoiser.state_dict(),
+
+            "optimizer":
+                optimizer.state_dict(),
+
+            "ema":
+                (
+                    ema.state_dict()
+                    if ema is not None
+                    else None
+                ),
+
+            "scaler":
+                (
+                    scaler.state_dict()
+                    if use_amp
+                    else None
+                ),
+
+            "train_loss":
+                train_loss,
+
+            "best_val":
+                best_val,
+
+            "config":
+                cfg,
+        }
 
         torch.save(
-            {
-                "epoch": epoch,
-                "denoiser": model.denoiser.state_dict(),
-                "logvar": model.logvar.detach().cpu(),
-                "optimizer": optimizer.state_dict(),
-                "ema": ema.state_dict(),
-                "train_loss": train_loss,
-                "config": cfg,
-            },
-            output_dir / "after_train.pt"
+            emergency_checkpoint,
+            output_dir
+            / "after_train.pt",
         )
 
+        # Sau torch.save() bỏ reference checkpoint tạm
+        del emergency_checkpoint
+        clear_cuda()
+
+        # ====================================================
+        # Validation
+        # ====================================================
+
         val_loss = validate(
-            model,
-            val_loader,
-            ema,
-            device,
-            max_val_batches
+            model=model,
+            loader=val_loader,
+            loss_fn=loss_fn,
+            ema=ema,
+            device=device,
+            max_batches=max_val_batches,
+        )
+
+        print_cuda_memory(
+            f"Epoch {epoch} after val"
         )
 
         print(
@@ -685,14 +716,22 @@ def main():
             "denoiser":
                 model.denoiser.state_dict(),
 
-            "logvar":
-                model.logvar.detach().cpu(),
-
             "optimizer":
                 optimizer.state_dict(),
 
             "ema":
-                ema.state_dict(),
+                (
+                    ema.state_dict()
+                    if ema is not None
+                    else None
+                ),
+
+            "scaler":
+                (
+                    scaler.state_dict()
+                    if use_amp
+                    else None
+                ),
 
             "train_loss":
                 train_loss,
@@ -700,28 +739,40 @@ def main():
             "val_loss":
                 val_loss,
 
+            "best_val":
+                min(
+                    best_val,
+                    val_loss,
+                ),
+
             "config":
                 cfg,
         }
 
         torch.save(
             checkpoint,
-            output_dir / "last.pt"
+            output_dir / "last.pt",
         )
 
         if val_loss < best_val:
-
             best_val = val_loss
+
+            checkpoint[
+                "best_val"
+            ] = best_val
 
             torch.save(
                 checkpoint,
-                output_dir / "best.pt"
+                output_dir / "best.pt",
             )
 
             print(
-                "Best LDM:",
-                best_val
+                "Best image diffusion:",
+                best_val,
             )
+
+        del checkpoint
+        clear_cuda()
 
 
 if __name__ == "__main__":

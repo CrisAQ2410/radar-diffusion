@@ -65,7 +65,7 @@ def extract(
     )
 
 
-class DiffusionSchedule(nn.Module):
+class GaussianDiffusion(nn.Module):
 
     def __init__(
         self,

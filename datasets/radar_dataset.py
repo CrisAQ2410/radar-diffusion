@@ -1,14 +1,17 @@
 import os
 import glob
 import re
-from datetime import datetime
 
-import cv2
+from datetime import datetime, timedelta
+
 import numpy as np
 import rasterio
 import torch
 
+from rasterio.enums import Resampling
 from torch.utils.data import Dataset
+
+from datasets.rain_events import RAIN_EVENTS
 
 
 class RadarDataset(Dataset):
@@ -19,123 +22,163 @@ class RadarDataset(Dataset):
         split="train",
         input_frames=6,
         output_frames=6,
-        image_size=256,
+        image_size=80,
         max_rainfall=260.0,
-        val_ratio=0.1,
-        test_year=2023,
     ):
 
-        self.input_frames = input_frames
-        self.output_frames = output_frames
-        self.total_frames = input_frames + output_frames
-
-        self.image_size = image_size
-        self.max_rainfall = max_rainfall
-
-        # --------------------------------------------------
-        # Load all tif
-        # --------------------------------------------------
-
-        all_files = sorted(
-            glob.glob(
-                os.path.join(
-                    root_dir,
-                    "**",
-                    "*.tif",
-                ),
-                recursive=True,
-            ),
-            key=self._timestamp,
-        )
-
-        # --------------------------------------------------
-        # Split by year
-        # --------------------------------------------------
-
-        train_val_files = [
-            f for f in all_files
-            if self._timestamp(f).year < test_year
-        ]
-
-        test_files = [
-            f for f in all_files
-            if self._timestamp(f).year == test_year
-        ]
-
-        n_train = int(
-            len(train_val_files)
-            * (1.0 - val_ratio)
-        )
-
-        if split == "train":
-            self.files = train_val_files[:n_train]
-
-        elif split == "val":
-            self.files = train_val_files[n_train:]
-
-        elif split == "test":
-            self.files = test_files
-
-        else:
+        if split not in RAIN_EVENTS:
             raise ValueError(
                 f"Invalid split: {split}"
             )
 
-        # --------------------------------------------------
-        # Create ONLY continuous sequences
-        # --------------------------------------------------
+        self.root_dir = root_dir
+        self.split = split
+
+        self.input_frames = input_frames
+        self.output_frames = output_frames
+
+        self.total_frames = (
+            input_frames
+            + output_frames
+        )
+
+        self.image_size = image_size
+        self.max_rainfall = max_rainfall
+
+        # ==================================================
+        # Load all TIFF files
+        # ==================================================
+
+        all_files = glob.glob(
+            os.path.join(
+                root_dir,
+                "**",
+                "*.tif",
+            ),
+            recursive=True,
+        )
+
+        all_files = sorted(
+            all_files,
+            key=self._timestamp,
+        )
+
+        # ==================================================
+        # Build samples PER RAIN EVENT
+        #
+        # Important:
+        # Không nối sequence giữa hai đợt mưa khác nhau.
+        # ==================================================
 
         self.samples = []
+        self.event_files = []
 
-        for i in range(
-            len(self.files)
-            - self.total_frames
-            + 1
-        ):
+        event_ranges = RAIN_EVENTS[split]
 
-            seq = self.files[
-                i:i + self.total_frames
+        for start_str, end_str in event_ranges:
+
+            start = datetime.strptime(
+                start_str,
+                "%d/%m/%Y",
+            )
+
+            # inclusive end date
+            end = (
+                datetime.strptime(
+                    end_str,
+                    "%d/%m/%Y",
+                )
+                + timedelta(
+                    days=1
+                )
+            )
+
+            files = [
+                f
+                for f in all_files
+                if start
+                <= self._timestamp(f)
+                < end
             ]
 
-            if self._is_continuous(seq):
+            files = sorted(
+                files,
+                key=self._timestamp,
+            )
 
-                self.samples.append(seq)
+            self.event_files.append(
+                files
+            )
+
+            # ----------------------------------------------
+            # continuous sequences inside this event only
+            # ----------------------------------------------
+
+            for i in range(
+                len(files)
+                - self.total_frames
+                + 1
+            ):
+
+                seq = files[
+                    i:
+                    i + self.total_frames
+                ]
+
+                if self._is_continuous(
+                    seq
+                ):
+                    self.samples.append(
+                        seq
+                    )
+
+        num_frames = sum(
+            len(x)
+            for x in self.event_files
+        )
 
         print(
             f"{split}: "
-            f"{len(self.files)} frames | "
+            f"{len(event_ranges)} events | "
+            f"{num_frames} frames | "
             f"{len(self.samples)} sequences"
         )
 
     # ======================================================
-    # Timestamp
+    # timestamp
     # ======================================================
 
     @staticmethod
     def _timestamp(path):
 
-        name = os.path.basename(path)
+        name = os.path.basename(
+            path
+        )
 
         match = re.search(
             r"(\d{10})",
-            name
+            name,
         )
 
         if match is None:
             raise ValueError(
-                f"Cannot parse timestamp: {path}"
+                f"Cannot parse timestamp: "
+                f"{path}"
             )
 
         return datetime.strptime(
             match.group(1),
-            "%Y%m%d%H"
+            "%Y%m%d%H",
         )
 
     # ======================================================
-    # continuity check
+    # Check hourly continuity
     # ======================================================
 
-    def _is_continuous(self, seq):
+    def _is_continuous(
+        self,
+        seq,
+    ):
 
         times = [
             self._timestamp(f)
@@ -144,14 +187,13 @@ class RadarDataset(Dataset):
 
         for a, b in zip(
             times[:-1],
-            times[1:]
+            times[1:],
         ):
 
             diff = (
                 b - a
             ).total_seconds() / 3600
 
-            # radar của bạn hiện cadence = 1 hour
             if diff != 1:
                 return False
 
@@ -161,64 +203,84 @@ class RadarDataset(Dataset):
 
     def __len__(self):
 
-        return len(self.samples)
+        return len(
+            self.samples
+        )
+
+    # ======================================================
+    # Read + spatial average resampling
+    # ======================================================
+
+    def _read_frame(
+        self,
+        path,
+    ):
+
+        with rasterio.open(
+            path
+        ) as src:
+
+            img = src.read(
+                1,
+
+                out_shape=(
+                    self.image_size,
+                    self.image_size,
+                ),
+
+                resampling=(
+                    Resampling.average
+                ),
+            )
+
+        img = np.asarray(
+            img,
+            dtype=np.float32,
+        )
+
+        img = np.nan_to_num(
+            img,
+            nan=0.0,
+            posinf=self.max_rainfall,
+            neginf=0.0,
+        )
+
+        # ==================================================
+        # Min-Max normalization [0, 1]
+        #
+        # x_min = 0
+        # x_max = 260
+        # ==================================================
+
+        img = np.clip(
+            img,
+            0.0,
+            self.max_rainfall,
+        )
+
+        img = (
+            img
+            /
+            self.max_rainfall
+        )
+
+        return img
 
     # ======================================================
 
-    def __getitem__(self, idx):
+    def __getitem__(
+        self,
+        idx,
+    ):
 
-        seq = self.samples[idx]
+        seq = self.samples[
+            idx
+        ]
 
-        frames = []
-
-        for f in seq:
-
-            with rasterio.open(f) as src:
-
-                img = src.read(1)
-
-            img = np.asarray(
-                img,
-                dtype=np.float32
-            )
-
-            img = np.nan_to_num(
-                img,
-                nan=0.0,
-                posinf=self.max_rainfall,
-                neginf=0.0,
-            )
-
-            img = np.clip(
-                img,
-                0,
-                self.max_rainfall,
-            )
-
-            if img.shape != (
-                self.image_size,
-                self.image_size,
-            ):
-
-                img = cv2.resize(
-                    img,
-                    (
-                        self.image_size,
-                        self.image_size,
-                    ),
-                    interpolation=cv2.INTER_AREA,
-                )
-
-            # SAME normalization as VAE
-            img = (
-                np.log1p(img)
-                /
-                np.log1p(
-                    self.max_rainfall
-                )
-            )
-
-            frames.append(img)
+        frames = [
+            self._read_frame(f)
+            for f in seq
+        ]
 
         frames = np.stack(
             frames,

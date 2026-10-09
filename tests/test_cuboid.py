@@ -1,94 +1,142 @@
 import torch
+import yaml
+
 from models.LDM.cuboid_transformer_unet import CuboidTransformerUNet
 
-device = "cuda:2"
+
+with open(
+    "configs/radar_ldm.yaml",
+    "r",
+) as f:
+    cfg = yaml.safe_load(f)
+
+
+device = torch.device(
+    cfg["training"]["device"]
+    if torch.cuda.is_available()
+    else "cpu"
+)
+
+m = cfg["model"]
 
 model = CuboidTransformerUNet(
-    input_shape=[6, 32, 32, 64],
-    target_shape=[6, 32, 32, 64],
+    input_shape=m["input_shape"],
+    target_shape=m["target_shape"],
 
-    base_units=128,
-    scale_alpha=1.0,
+    base_units=m["base_units"],
+    scale_alpha=m["scale_alpha"],
+    num_heads=m["num_heads"],
 
-    depth=[4, 4],
-    downsample=2,
-    downsample_type="patch_merge",
+    depth=m["depth"],
 
-    upsample_type="upsample",
-    upsample_kernel_size=3,
+    block_attn_patterns=m["self_pattern"],
 
-    block_attn_patterns=["axial", "axial"],
+    downsample=m["downsample"],
+    downsample_type=m["downsample_type"],
 
-    num_heads=4,
+    upsample_type=m["upsample_type"],
+    upsample_kernel_size=m["upsample_kernel_size"],
 
-    attn_drop=0.1,
-    proj_drop=0.1,
-    ffn_drop=0.1,
+    attn_drop=m["attn_drop"],
+    proj_drop=m["proj_drop"],
+    ffn_drop=m["ffn_drop"],
 
-    ffn_activation="gelu",
-    gated_ffn=False,
+    ffn_activation=m["ffn_activation"],
+    gated_ffn=m["gated_ffn"],
 
-    norm_layer="layer_norm",
-    padding_type="zeros",
-    pos_embed_type="t+h+w",
+    norm_layer=m["norm_layer"],
+    padding_type=m["padding_type"],
+    pos_embed_type=m["pos_embed_type"],
 
-    checkpoint_level=0,
-    use_relative_pos=True,
-    self_attn_use_final_proj=True,
+    checkpoint_level=m["checkpoint_level"],
+    use_relative_pos=m["use_relative_pos"],
+    self_attn_use_final_proj=m[
+        "self_attn_use_final_proj"
+    ],
 
-    num_global_vectors=0,
-    use_global_vector_ffn=False,
-    use_global_self_attn=True,
-    separate_global_qkv=True,
-    global_dim_ratio=1,
+    num_global_vectors=m[
+        "num_global_vectors"
+    ],
+    use_global_vector_ffn=m[
+        "use_global_vector_ffn"
+    ],
+    use_global_self_attn=m[
+        "use_global_self_attn"
+    ],
+    separate_global_qkv=m[
+        "separate_global_qkv"
+    ],
+    global_dim_ratio=m[
+        "global_dim_ratio"
+    ],
 
-    attn_linear_init_mode="0",
-    ffn_linear_init_mode="0",
-    ffn2_linear_init_mode="2",
-    attn_proj_linear_init_mode="2",
+    time_embed_channels_mult=m[
+        "time_embed_channels_mult"
+    ],
+    time_embed_use_scale_shift_norm=m[
+        "time_embed_use_scale_shift_norm"
+    ],
+    time_embed_dropout=m[
+        "time_embed_dropout"
+    ],
 
-    conv_init_mode="0",
-    down_linear_init_mode="0",
-    up_linear_init_mode="0",
-
-    global_proj_linear_init_mode="2",
-    norm_init_mode="0",
-
-    time_embed_channels_mult=4,
-    time_embed_use_scale_shift_norm=False,
-    time_embed_dropout=0.0,
-
-    unet_res_connect=True,
+    unet_res_connect=m[
+        "unet_res_connect"
+    ],
 ).to(device)
 
 
-x = torch.randn(
-    1, 6, 32, 32, 64,
-    device=device
+x = torch.rand(
+    1,
+    6,
+    80,
+    80,
+    1,
+    device=device,
 )
 
-cond = torch.randn(
-    1, 6, 32, 32, 64,
-    device=device
+cond = torch.rand(
+    1,
+    6,
+    80,
+    80,
+    1,
+    device=device,
 )
 
 t = torch.randint(
     0,
     1000,
     (1,),
-    device=device
-)
+    device=device,
+).long()
 
 
 with torch.no_grad():
+
     out = model(
         x,
         t,
-        cond
+        cond,
     )
 
 
-print("x    :", x.shape)
-print("cond :", cond.shape)
-print("t    :", t.shape)
-print("out  :", out.shape)
+print(
+    "x    :",
+    x.shape
+)
+
+print(
+    "cond :",
+    cond.shape
+)
+
+print(
+    "t    :",
+    t.shape
+)
+
+print(
+    "out  :",
+    out.shape
+)

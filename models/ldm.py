@@ -1,193 +1,118 @@
 import torch
-import torch.nn as nn
-
-from models.diffusion import DiffusionSchedule
+from torch import nn
 
 
-class RadarLatentDiffusion(nn.Module):
+class RadarDiffusionModel(nn.Module):
 
     def __init__(
         self,
-        vae,
         denoiser,
-        timesteps=1000,
-        cosine_s=0.008,
-        learn_logvar=True,
-        logvar_init=0.0
+        diffusion,
     ):
         super().__init__()
 
-        self.vae = vae
-
         self.denoiser = denoiser
+        self.diffusion = diffusion
 
-        self.diffusion = DiffusionSchedule(
-            timesteps=timesteps,
-            cosine_s=cosine_s
-        )
+    # =====================================================
+    # shape helper
+    # =====================================================
 
-        self.timesteps = timesteps
+    @staticmethod
+    def to_channels_last(x):
+        """
+        [B,T,H,W]
+        ->
+        [B,T,H,W,1]
+        """
 
-        # freeze VAE
-        self.vae.eval()
+        if x.ndim == 4:
+            x = x.unsqueeze(-1)
 
-        for p in self.vae.parameters():
-            p.requires_grad = False
+        return x
 
-        self.learn_logvar = (
-            learn_logvar
-        )
-
-        self.logvar = nn.Parameter(
-            torch.full(
-                (timesteps,),
-                float(logvar_init)
-            ),
-            requires_grad=learn_logvar
-        )
-
-    @torch.no_grad()
-    def encode_sequence(
-        self,
-        x,
-        sample_posterior=True
-    ):
-        B, T, H, W = x.shape
-
-        x = x.reshape(
-            B * T,
-            1,
-            H,
-            W
-        )
-
-        posterior = self.vae.encode(x)
-
-        if sample_posterior:
-            z = posterior.sample()
-        else:
-            z = posterior.mode()
-
-        _, C, h, w = z.shape
-
-        z = z.reshape(
-            B,
-            T,
-            C,
-            h,
-            w
-        )
-
-        z = z.permute(
-            0, 1, 3, 4, 2
-        ).contiguous()
-
-        return z
+    # =====================================================
+    # forward training
+    # =====================================================
 
     def forward(
         self,
         past,
-        future
+        future,
+        t=None,
+        noise=None,
     ):
 
-        with torch.no_grad():
+        # -----------------------------------------------
+        # Dataset:
+        # [B,6,80,80]
+        #
+        # CuboidTransformer:
+        # [B,6,80,80,1]
+        # -----------------------------------------------
 
-            z_past = self.encode_sequence(
-                past,
-                sample_posterior=False
-            )
-
-            z_future = self.encode_sequence(
-                future,
-                sample_posterior=True
-            )
-
-        B = z_future.shape[0]
-
-        if self.training:
-
-            # 50% vẫn học toàn bộ diffusion trajectory
-            t = torch.randint(
-                0,
-                self.timesteps,
-                (B,),
-                device=z_future.device
-            )
-
-            # 50% batch ưu tiên vùng noise cao
-            high_mask = (
-                torch.rand(
-                    B,
-                    device=z_future.device
-                ) < 0.5
-            )
-
-            high_t = torch.randint(
-                900,
-                self.timesteps,
-                (B,),
-                device=z_future.device
-            )
-
-            t = torch.where(
-                high_mask,
-                high_t,
-                t
-            )
-
-        else:
-
-            # validation vẫn uniform để so sánh công bằng
-            t = torch.randint(
-                0,
-                self.timesteps,
-                (B,),
-                device=z_future.device
-            )
-
-        t = t.long()
-
-        noise = torch.randn_like(
-            z_future
+        past = self.to_channels_last(
+            past
         )
 
-        z_noisy = self.diffusion.q_sample(
-            x_start=z_future,
+        future = self.to_channels_last(
+            future
+        )
+
+        B = future.shape[0]
+
+        # -----------------------------------------------
+        # random diffusion timestep
+        # -----------------------------------------------
+
+        if t is None:
+
+            t = torch.randint(
+                0,
+                self.diffusion.timesteps,
+                (B,),
+                device=future.device,
+            ).long()
+
+        # -----------------------------------------------
+        # Gaussian noise
+        # -----------------------------------------------
+
+        if noise is None:
+
+            noise = torch.randn_like(
+                future
+            )
+
+        # -----------------------------------------------
+        # forward diffusion:
+        #
+        # x_t =
+        # sqrt(alpha_bar_t) * x0
+        # +
+        # sqrt(1-alpha_bar_t) * noise
+        # -----------------------------------------------
+
+        x_t = self.diffusion.q_sample(
+            x_start=future,
             t=t,
-            noise=noise
+            noise=noise,
         )
 
-        # senior main config = x0 prediction
-        prediction = self.denoiser(
-            z_noisy,
+        # -----------------------------------------------
+        # DIRECT x0 prediction
+        # -----------------------------------------------
+
+        x0_pred = self.denoiser(
+            x_t,
             t,
-            z_past
+            past,
         )
-
-        target = z_future
-
-        loss_simple = (
-            (prediction - target) ** 2
-        ).mean(
-            dim=(1, 2, 3, 4)
-        )
-
-        logvar_t = self.logvar[t]
-
-        loss = (
-            loss_simple
-            /
-            torch.exp(logvar_t)
-            +
-            logvar_t
-        )
-
-        loss = loss.mean()
 
         return {
-            "loss": loss,
-            "loss_simple":
-                loss_simple.mean(),
-            "logvar":
-                logvar_t.mean(),
+            "pred": x0_pred,
+            "target": future,
+            "x_t": x_t,
+            "t": t,
+            "noise": noise,
         }
