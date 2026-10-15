@@ -1,5 +1,5 @@
 import os
-import math
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -7,80 +7,24 @@ import yaml
 import matplotlib.pyplot as plt
 
 from datasets.radar_dataset import RadarDataset
-
-from models.VAE.autoencoder_kl import AutoencoderKL
+from models.diffusion import GaussianDiffusion
 from models.LDM.cuboid_transformer_unet import CuboidTransformerUNet
-from models.ldm import RadarLatentDiffusion
-
-from utils.ema import LitEma
+from models.ldm import RadarDiffusionModel
 
 
 DEVICE = "cuda:2"
-
 CONFIG_PATH = "configs/radar_ldm.yaml"
-CHECKPOINT_PATH = "checkpoints/ldm_mode/best.pt"
 
-OUTPUT_DIR = "outputs/ldm_samples"
+# Validation trước đó còn stochastic, nên với run 5 epoch hiện tại
+# dùng last.pt để kiểm tra đúng model sau epoch 5.
+CHECKPOINT_NAME = "best_cc.pt"
 
+OUTPUT_DIR = "outputs/image_diffusion_mse_samples"
 
-# ============================================================
-# Build VAE
-# ============================================================
-
-def build_vae(cfg):
-
-    with open(
-        cfg["vae"]["config"],
-        "r"
-    ) as f:
-
-        vae_cfg = yaml.safe_load(f)
-
-    m = vae_cfg["model"]
-
-    vae = AutoencoderKL(
-
-        in_channels=m["in_channels"],
-        out_channels=m["out_channels"],
-
-        down_block_types=tuple(
-            m["down_block_types"]
-        ),
-
-        up_block_types=tuple(
-            m["up_block_types"]
-        ),
-
-        block_out_channels=tuple(
-            m["block_out_channels"]
-        ),
-
-        layers_per_block=m[
-            "layers_per_block"
-        ],
-
-        latent_channels=m[
-            "latent_channels"
-        ],
-
-        norm_num_groups=m[
-            "norm_num_groups"
-        ],
-    )
-
-    vae.load_state_dict(
-        torch.load(
-            cfg["vae"]["checkpoint"],
-            map_location="cpu"
-        )
-    )
-
-    vae.eval()
-
-    for p in vae.parameters():
-        p.requires_grad = False
-
-    return vae
+# Chạy 1 sample trước vì DDPM cần đủ 1000 reverse steps.
+NUM_SAMPLES = 1
+SEARCH_STEP = 10
+SEED = 12345
 
 
 # ============================================================
@@ -88,15 +32,13 @@ def build_vae(cfg):
 # ============================================================
 
 def build_denoiser(cfg):
-
     m = cfg["model"]
 
     patterns = [
         m["self_pattern"]
     ] * len(m["depth"])
 
-    model = CuboidTransformerUNet(
-
+    return CuboidTransformerUNet(
         input_shape=m["input_shape"],
         target_shape=m["target_shape"],
 
@@ -202,178 +144,198 @@ def build_denoiser(cfg):
         unet_res_connect=m[
             "unet_res_connect"
         ],
-
     )
-
-    return model
-
-
-# ============================================================
-# Decode latent sequence
-# ============================================================
-
-@torch.no_grad()
-def decode_sequence(
-    vae,
-    z
-):
-    """
-    z:
-    [B,T,H,W,C]
-
-    output:
-    [B,T,256,256]
-    """
-
-    B, T, H, W, C = z.shape
-
-    z = z.permute(
-        0,
-        1,
-        4,
-        2,
-        3
-    ).contiguous()
-
-    z = z.reshape(
-        B * T,
-        C,
-        H,
-        W
-    )
-
-    x = vae.decode(z)
-
-    x = x.reshape(
-        B,
-        T,
-        x.shape[-2],
-        x.shape[-1]
-    )
-
-    return x
 
 
 # ============================================================
 # Reverse DDPM
+# x_t -> x_{t-1}, model predicts x0 directly
 # ============================================================
 
 @torch.no_grad()
 def sample_ddpm(
     model,
-    z_past
+    past,
+    seed=SEED,
 ):
-
     schedule = model.diffusion
 
-    B = z_past.shape[0]
-
-    shape = z_past.shape
-
-    # x_T
-    z = torch.randn(
-        shape,
-        device=z_past.device
+    # Dataset: [B, 6, 80, 80]
+    # Denoiser: [B, 6, 80, 80, 1]
+    past = model.to_channels_last(
+        past
     )
 
-    for i in reversed(
-        range(model.timesteps)
-    ):
+    B = past.shape[0]
 
+    generator = torch.Generator(
+        device=past.device
+    )
+    generator.manual_seed(seed)
+
+    # x_T ~ N(0, I)
+    x = torch.randn(
+        past.shape,
+        device=past.device,
+        dtype=past.dtype,
+        generator=generator,
+    )
+
+    timesteps = schedule.timesteps
+
+    for i in reversed(
+        range(timesteps)
+    ):
         t = torch.full(
             (B,),
             i,
-            device=z.device,
-            dtype=torch.long
+            device=x.device,
+            dtype=torch.long,
         )
 
-        # x0 prediction
-        z0_pred = model.denoiser(
-            z,
-            t,
-            z_past
+        # Không cần gradient khi inference.
+        # AMP giảm VRAM và tăng tốc.
+        with torch.cuda.amp.autocast(
+            enabled=(x.device.type == "cuda")
+        ):
+            x0_pred = model.denoiser(
+                x,
+                t,
+                past,
+            )
+
+        # Không clamp x0 ở giữa reverse process để không tự ý
+        # thay đổi dynamics so với công thức DDPM.
+        coef1 = (
+            schedule
+            .posterior_mean_coef1[t]
+            .reshape(
+                B, 1, 1, 1, 1
+            )
         )
 
-        coef1 = schedule.posterior_mean_coef1[
-            t
-        ].reshape(
-            B, 1, 1, 1, 1
-        )
-
-        coef2 = schedule.posterior_mean_coef2[
-            t
-        ].reshape(
-            B, 1, 1, 1, 1
+        coef2 = (
+            schedule
+            .posterior_mean_coef2[t]
+            .reshape(
+                B, 1, 1, 1, 1
+            )
         )
 
         model_mean = (
-            coef1 * z0_pred
-            +
-            coef2 * z
+            coef1 * x0_pred.float()
+            + coef2 * x.float()
         )
 
         if i > 0:
-
             log_variance = (
                 schedule
-                .posterior_log_variance_clipped[
-                    t
-                ]
+                .posterior_log_variance_clipped[t]
                 .reshape(
                     B, 1, 1, 1, 1
                 )
             )
 
-            noise = torch.randn_like(
-                z
+            noise = torch.randn(
+                x.shape,
+                device=x.device,
+                dtype=torch.float32,
+                generator=generator,
             )
 
-            z = (
+            x = (
                 model_mean
-                +
-                torch.exp(
-                    0.5
-                    * log_variance
+                + torch.exp(
+                    0.5 * log_variance
                 )
                 * noise
             )
-
         else:
-
-            z = model_mean
+            x = model_mean
 
         if (
             i % 100 == 0
-            or i == 999
+            or i == timesteps - 1
         ):
             print(
                 f"Sampling timestep {i}"
             )
 
-    return z
+    # Final prediction ở image-space normalized [0,1].
+    return x.clamp(
+        0.0,
+        1.0,
+    )
 
 
 # ============================================================
-# Inverse normalization
+# Inverse Min-Max normalization
+# Thesis preprocessing:
+# x_norm = rain / 260
 # ============================================================
 
 def to_rainfall(
     x,
-    max_rainfall
+    max_rainfall,
 ):
-
     x = np.clip(
         x,
         0.0,
-        1.0
+        1.0,
     )
 
-    return np.expm1(
+    return (
         x
-        * np.log1p(
-            max_rainfall
+        * max_rainfall
+    )
+
+
+# ============================================================
+# Basic sample metrics
+# ============================================================
+
+def sample_metrics(
+    pred,
+    truth,
+):
+    pred = pred.astype(
+        np.float64
+    )
+    truth = truth.astype(
+        np.float64
+    )
+
+    mae = np.mean(
+        np.abs(
+            pred - truth
         )
     )
+
+    rmse = np.sqrt(
+        np.mean(
+            (pred - truth) ** 2
+        )
+    )
+
+    pred_flat = pred.reshape(-1)
+    truth_flat = truth.reshape(-1)
+
+    if (
+        np.std(pred_flat) > 0
+        and np.std(truth_flat) > 0
+    ):
+        cc = np.corrcoef(
+            pred_flat,
+            truth_flat,
+        )[0, 1]
+    else:
+        cc = np.nan
+
+    return {
+        "mae": float(mae),
+        "rmse": float(rmse),
+        "cc": float(cc),
+    }
 
 
 # ============================================================
@@ -384,55 +346,53 @@ def plot_sequence(
     past,
     truth,
     pred,
-    path
+    path,
 ):
-
     fig, axes = plt.subplots(
         3,
         6,
-        figsize=(18, 9)
+        figsize=(18, 9),
     )
 
     vmax = max(
-        truth.max(),
-        pred.max(),
-        past.max(),
-        1.0
+        float(truth.max()),
+        float(pred.max()),
+        float(past.max()),
+        1.0,
     )
 
     for t in range(6):
-
         axes[0, t].imshow(
             past[t],
             cmap="jet",
             vmin=0,
-            vmax=vmax
+            vmax=vmax,
         )
 
         axes[1, t].imshow(
             truth[t],
             cmap="jet",
             vmin=0,
-            vmax=vmax
+            vmax=vmax,
         )
 
         axes[2, t].imshow(
             pred[t],
             cmap="jet",
             vmin=0,
-            vmax=vmax
+            vmax=vmax,
         )
 
         axes[0, t].set_title(
-            f"Past {t+1}"
+            f"Past {t + 1}"
         )
 
         axes[1, t].set_title(
-            f"GT {t+1}"
+            f"GT {t + 1}"
         )
 
         axes[2, t].set_title(
-            f"Pred {t+1}"
+            f"Pred {t + 1}"
         )
 
         for row in range(3):
@@ -444,10 +404,54 @@ def plot_sequence(
 
     plt.savefig(
         path,
-        dpi=150
+        dpi=150,
     )
 
     plt.close()
+
+
+# ============================================================
+# Pick rainy samples
+# ============================================================
+
+def find_rainy_samples(
+    dataset,
+    top_k=1,
+    step=10,
+):
+    scores = []
+
+    for idx in range(
+        0,
+        len(dataset),
+        step,
+    ):
+        _, future = dataset[idx]
+
+        # Dữ liệu hiện tại đã Min-Max [0,1].
+        # Tổng future càng lớn => sample có nhiều mưa hơn.
+        score = future.sum().item()
+
+        scores.append(
+            (score, idx)
+        )
+
+    scores.sort(
+        reverse=True
+    )
+
+    selected = [
+        idx
+        for _, idx
+        in scores[:top_k]
+    ]
+
+    print(
+        "Rainy samples:",
+        selected,
+    )
+
+    return selected
 
 
 # ============================================================
@@ -455,17 +459,17 @@ def plot_sequence(
 # ============================================================
 
 def main():
-
-    os.makedirs(
-        OUTPUT_DIR,
-        exist_ok=True
+    Path(
+        OUTPUT_DIR
+    ).mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
     with open(
         CONFIG_PATH,
-        "r"
+        "r",
     ) as f:
-
         cfg = yaml.safe_load(f)
 
     device = torch.device(
@@ -476,111 +480,88 @@ def main():
 
     print(
         "Device:",
-        device
+        device,
     )
 
-    # --------------------------
-    # Build models
-    # --------------------------
+    torch.manual_seed(
+        SEED
+    )
 
-    vae = build_vae(
-        cfg
-    ).to(device)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(
+            SEED
+        )
+
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
 
     denoiser = build_denoiser(
         cfg
     ).to(device)
 
-    dcfg = cfg[
-        "diffusion"
-    ]
+    dcfg = cfg["diffusion"]
 
-    model = RadarLatentDiffusion(
-
-        vae=vae,
-
-        denoiser=denoiser,
-
-        timesteps=dcfg[
-            "timesteps"
-        ],
-
-        cosine_s=dcfg[
-            "cosine_s"
-        ],
-
-        learn_logvar=dcfg[
-            "learn_logvar"
-        ],
-
-        logvar_init=dcfg[
-            "logvar_init"
-        ],
-
+    diffusion = GaussianDiffusion(
+        timesteps=dcfg["timesteps"],
     ).to(device)
 
-    # --------------------------
-    # Load checkpoint
-    # --------------------------
+    model = RadarDiffusionModel(
+        denoiser=denoiser,
+        diffusion=diffusion,
+    ).to(device)
+
+    checkpoint_path = (
+        Path(
+            cfg["output"]["dir"]
+        )
+        / CHECKPOINT_NAME
+    )
+
+    print(
+        "Checkpoint:",
+        checkpoint_path,
+    )
 
     checkpoint = torch.load(
-        CHECKPOINT_PATH,
-        map_location=device
+        checkpoint_path,
+        map_location=device,
     )
 
     model.denoiser.load_state_dict(
         checkpoint["denoiser"]
     )
 
-    if "logvar" in checkpoint:
-
-        model.logvar.data.copy_(
-            checkpoint["logvar"]
-            .to(device)
-        )
-
-    # --------------------------
-    # EMA
-    # --------------------------
-
-    ema = LitEma(
-        model.denoiser,
-        decay=cfg[
-            "training"
-        ]["ema_decay"]
-    ).to(device)
-
-    ema.load_state_dict(
-        checkpoint["ema"]
-    )
-
-    # dùng EMA weights để inference
-    ema.copy_to(
-        model.denoiser
-    )
-
+    # EMA đang tắt ở run này nên KHÔNG load/copy EMA.
     model.eval()
 
     print(
         "Loaded epoch:",
-        checkpoint["epoch"]
+        checkpoint["epoch"],
+    )
+
+    print(
+        "Train loss:",
+        checkpoint.get(
+            "train_loss"
+        ),
     )
 
     print(
         "Val loss:",
-        checkpoint["val_loss"]
+        checkpoint.get(
+            "val_loss"
+        ),
     )
 
-    # --------------------------
+    # --------------------------------------------------------
     # Test dataset
-    # --------------------------
+    # --------------------------------------------------------
 
     d = cfg["data"]
 
     dataset = RadarDataset(
-
         root_dir=d["root"],
-
         split="test",
 
         input_frames=d[
@@ -598,69 +579,22 @@ def main():
         max_rainfall=d[
             "max_rainfall"
         ],
-
-        val_ratio=d[
-            "val_ratio"
-        ],
-
-        test_year=d[
-            "test_year"
-        ],
     )
-
-    # vài sample trước
-    def find_rainy_samples(
-        dataset,
-        max_rainfall,
-        top_k=3,
-        step=10,
-    ):
-        scores = []
-
-        for idx in range(
-            0,
-            len(dataset),
-            step
-        ):
-            _, future = dataset[idx]
-
-            # future đang ở log-normalized [0,1]
-            # score càng lớn -> lượng mưa tổng càng nhiều
-            score = future.sum().item()
-
-            scores.append(
-                (score, idx)
-            )
-
-        scores.sort(
-            reverse=True
-        )
-
-        selected = [
-            idx
-            for score, idx
-            in scores[:top_k]
-        ]
-
-        print(
-            "Rainy samples:",
-            selected
-        )
-
-        return selected
 
     indices = find_rainy_samples(
         dataset,
-        d["max_rainfall"],
-        top_k=3,
-        step=10
+        top_k=NUM_SAMPLES,
+        step=SEARCH_STEP,
     )
 
-    for idx in indices:
+    # --------------------------------------------------------
+    # Inference
+    # --------------------------------------------------------
 
+    for idx in indices:
         print(
             "\nSample:",
-            idx
+            idx,
         )
 
         past, future = dataset[
@@ -673,69 +607,44 @@ def main():
             .to(device)
         )
 
-        # ----------------------
-        # Encode condition
-        # ----------------------
-
-        with torch.no_grad():
-
-            z_past = (
-                model
-                .encode_sequence(
-                    past_batch,
-                    sample_posterior=False
-                )
-            )
-
         print(
             "condition:",
-            z_past.shape
+            past_batch.shape,
         )
 
-        # ----------------------
-        # reverse diffusion
-        # ----------------------
-
-        z_pred = sample_ddpm(
+        pred = sample_ddpm(
             model,
-            z_past
+            past_batch,
+            seed=SEED + idx,
         )
 
         print(
-            "pred latent:",
-            z_pred.shape
+            "prediction:",
+            pred.shape,
         )
 
-        # ----------------------
-        # VAE decode
-        # ----------------------
-
-        pred = decode_sequence(
-            vae,
-            z_pred
-        )
-
-        pred = (
-            pred[0]
+        # [1,6,80,80,1]
+        # -> [6,80,80]
+        pred_np = (
+            pred[0, ..., 0]
+            .float()
             .cpu()
             .numpy()
         )
 
         past_np = (
             past
+            .float()
             .cpu()
             .numpy()
         )
 
         future_np = (
             future
+            .float()
             .cpu()
             .numpy()
         )
-
-        # ----------------------
-        # inverse log norm
-        # ----------------------
 
         max_rain = d[
             "max_rainfall"
@@ -743,39 +652,62 @@ def main():
 
         past_mm = to_rainfall(
             past_np,
-            max_rain
+            max_rain,
         )
 
         future_mm = to_rainfall(
             future_np,
-            max_rain
+            max_rain,
         )
 
         pred_mm = to_rainfall(
-            pred,
-            max_rain
+            pred_np,
+            max_rain,
         )
 
-        # ----------------------
-        # save
-        # ----------------------
+        metrics = sample_metrics(
+            pred_mm,
+            future_mm,
+        )
 
-        output_path = os.path.join(
-            OUTPUT_DIR,
-            f"sample_{idx}.png"
+        print(
+            "MAE :",
+            f"{metrics['mae']:.4f}",
+        )
+
+        print(
+            "RMSE:",
+            f"{metrics['rmse']:.4f}",
+        )
+
+        print(
+            "CC  :",
+            f"{metrics['cc']:.4f}",
+        )
+
+        output_path = (
+            Path(OUTPUT_DIR)
+            / f"sample_{idx}.png"
         )
 
         plot_sequence(
             past_mm,
             future_mm,
             pred_mm,
-            output_path
+            output_path,
         )
 
         print(
             "Saved:",
-            output_path
+            output_path,
         )
+
+        # Giải phóng sample trước sample tiếp theo
+        del past_batch
+        del pred
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

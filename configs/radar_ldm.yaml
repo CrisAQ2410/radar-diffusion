@@ -71,28 +71,32 @@ diffusion:
 loss:
   type: "mse"
 
+loss:
+  type: "mse"
+
 training:
   device: "cuda:2"
 
   batch_size: 1
   num_workers: 2
 
-  lr: 0.0003
+  lr: 0.0001
   weight_decay: 0.00001
-
   gradient_clip: 1.0
   accumulation_steps: 6
+
   ema_decay: 0.9999
-
-  # checkpoint latent cũ không load được nữa
-  resume: null
-
-  epochs: 70
-
-  max_train_batches: 5
-  max_val_batches: 2
-
+  use_amp: true
   use_ema: false
 
+  seed: 12345
+
+  resume: "checkpoints/image_diffusion_mse_lr1e4/best_cc.pt"
+
+  epochs: 10
+
+  max_train_batches: null
+  max_val_batches: null
+
 output:
-  dir: "checkpoints/image_diffusion_mse"
+  dir: "checkpoints/image_diffusion_mse_lr1e4"
