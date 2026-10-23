@@ -70,9 +70,7 @@ diffusion:
 
 loss:
   type: "mse"
-
-loss:
-  type: "mse"
+  weighting: "steep"
 
 training:
   device: "cuda:2"
@@ -80,8 +78,9 @@ training:
   batch_size: 1
   num_workers: 2
 
-  lr: 0.0001
+  lr: 0.00003
   weight_decay: 0.00001
+
   gradient_clip: 1.0
   accumulation_steps: 6
 
@@ -91,12 +90,13 @@ training:
 
   seed: 12345
 
-  resume: "checkpoints/image_diffusion_mse_lr1e4/best_cc.pt"
+  resume: null
+  resume_weights_only: false
 
-  epochs: 10
+  epochs: 5
 
   max_train_batches: null
   max_val_batches: null
 
 output:
-  dir: "checkpoints/image_diffusion_mse_lr1e4"
+  dir: "checkpoints/image_diffusion_mse_steep"
